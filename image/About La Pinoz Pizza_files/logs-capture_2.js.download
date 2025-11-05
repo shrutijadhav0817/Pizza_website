@@ -1,0 +1,183 @@
+(function (global) {
+  const MiniSentry = {};
+  const cfg = {
+    tokenUrl: "https://xgit60rir0.execute-api.ap-south-1.amazonaws.com/prod/generate-token",
+    endpoint: "https://xgit60rir0.execute-api.ap-south-1.amazonaws.com/prod/log",
+    environment: "production",
+    flushInterval: 5000,    // 5s batching
+    maxBatchSize: 10,
+    dedupWindow: 5 * 60 * 1000 // 5 min
+  };
+
+  let token = null;
+  let queue = [];
+  let dedupeMap = new Map();
+  let timerId = null;
+
+  // --- Token fetch with caching ---
+  async function fetchToken() {
+    try {
+      const cached = localStorage.getItem("miniSentryToken");
+      const cachedExp = localStorage.getItem("miniSentryTokenExp");
+
+      if (cached && cachedExp && Date.now() < parseInt(cachedExp, 10)) {
+        token = cached;
+        console.log("MiniSentry: using cached token");
+        return;
+      }
+
+      const res = await fetch(cfg.tokenUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: window.location.hostname })
+      });
+      const data = await res.json();
+      token = data.token;
+
+      // Cache for 24h
+      const expiryMs = 24 * 60 * 60 * 1000;
+      localStorage.setItem("miniSentryToken", token);
+      localStorage.setItem("miniSentryTokenExp", (Date.now() + expiryMs).toString());
+
+      console.log("MiniSentry: new token fetched and cached");
+    } catch (e) {
+      console.error("MiniSentry: failed to fetch token", e);
+    }
+  }
+
+  // --- Helpers ---
+  function nowISO() { return new Date().toISOString(); }
+  function makeKey(evt) { return `${evt.type}::${evt.message || ""}::${evt.source || ""}`; }
+  function shouldDedup(key) {
+    const t = Date.now();
+    if (dedupeMap.has(key) && (t - dedupeMap.get(key) < cfg.dedupWindow)) return false;
+    dedupeMap.set(key, t);
+    return true;
+  }
+
+  function enqueue(evt) {
+    const key = makeKey(evt);
+    if (!shouldDedup(key)) return;
+    queue.push({
+      ts: nowISO(),
+      environment: cfg.environment,
+      event: evt
+    });
+    if (queue.length >= cfg.maxBatchSize) {
+      flush();
+    } else {
+      startTimer();
+    }
+  }
+
+  // --- Send logs ---
+  async function flush() {
+    if (!token) return;
+    if (!queue.length) return; // nothing to send
+
+    const batch = queue.splice(0, cfg.maxBatchSize);
+    if (!batch.length) return;
+
+    const payload = { records: batch };
+
+    try {
+      await fetch(cfg.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + token
+        },
+        body: JSON.stringify(payload),
+        keepalive: true
+      });
+    } catch (e) {
+      // swallow errors
+    }
+
+    // Stop timer if nothing left
+    if (queue.length === 0 && timerId) {
+      clearInterval(timerId);
+      timerId = null;
+    }
+  }
+
+  function flushOnUnload() {
+    if (!queue.length || !token) return;
+    const payload = { records: queue, auth: token }; // fallback auth
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(cfg.endpoint, new Blob([JSON.stringify(payload)], { type: "application/json" }));
+      } else {
+        fetch(cfg.endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          keepalive: true
+        });
+      }
+      queue = [];
+    } catch (e) {}
+  }
+
+  function startTimer() {
+    if (timerId) return;
+    timerId = setInterval(() => {
+      if (queue.length > 0) flush();
+    }, cfg.flushInterval);
+  }
+
+  // --- Global hooks ---
+  function hookErrors() {
+    const origOnError = window.onerror;
+    window.onerror = function (msg, src, line, col, err) {
+      enqueue({
+        type: "error",
+        message: String(msg),
+        source: src,
+        lineno: line,
+        colno: col,
+        stack: err?.stack || null
+      });
+      if (typeof origOnError === "function") origOnError.apply(this, arguments);
+    };
+
+    window.addEventListener("unhandledrejection", e => {
+      const reason = e.reason || {};
+      enqueue({
+        type: "unhandledrejection",
+        message: reason.message || String(reason),
+        stack: reason.stack || null
+      });
+    });
+
+    const origConsoleError = console.error;
+    console.error = function (...args) {
+      enqueue({
+        type: "console.error",
+        message: args.map(a => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ")
+      });
+      origConsoleError.apply(console, args);
+    };
+
+    window.addEventListener("beforeunload", flushOnUnload, { capture: true });
+    window.addEventListener("pagehide", flushOnUnload, { capture: true });
+  }
+
+  // --- Public API ---
+  MiniSentry.init = async function (options) {
+    Object.assign(cfg, options);
+    await fetchToken();
+    hookErrors();
+    console.log("MiniSentry initialized");
+  };
+
+  MiniSentry.captureMessage = function (msg) {
+    enqueue({ type: "manual.message", message: String(msg) });
+  };
+
+  MiniSentry.captureException = function (err) {
+    enqueue({ type: "manual.exception", message: err?.message || String(err), stack: err?.stack || null });
+  };
+
+  global.MiniSentry = MiniSentry;
+})(window);
